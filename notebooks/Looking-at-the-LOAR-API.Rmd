@@ -1,0 +1,341 @@
+---
+title: "Exploring the LOAR API"
+author: "Per Møldrup-Dalum"
+date: '2020-05-27'
+output:
+  html_document:
+    df_print: paged
+---
+
+The Royal Danish Library has made public the OCR text of a large amount of newspapers published during the years from 1666 up to 1877. This newspaper collection is available at the Royal Library Open Access Repository: [LOAR](https://loar.kb.dk).
+
+The collection can also be accessed using an API. The system under LOAR is DSPace. The API is described at [DSpace REST API](https://loar.kb.dk/rest/). In this post, I'll explore this API using R.
+
+# Extending R
+
+Start by loading the [Tidyverse](https://www.tidyverse.org), a library for using JSON in R, and a library for date and time.
+
+```{r, message=FALSE}
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+```
+
+# Finding the newspaper collection
+
+The top level of the LOAR hierarchy is something called communities, but we don't need that concept here. Still, it it gives an idea about where the collections stems from.
+
+```{r paged.print=FALSE}
+fromJSON("https://loar.kb.dk/rest/communities") %>% select(name)
+```
+
+
+But, as we don't need that hierarchy level, just list the available collections.
+
+```{r paged.print=FALSE}
+fromJSON("https://loar.kb.dk/rest/collections") %>% select(name)
+```
+
+So, the newspapers are split into four collections. To get those collections, we need their ids. We'll store this list of collections and ids for later
+
+```{r}
+fromJSON("https://loar.kb.dk/rest/collections") %>%
+  filter(str_detect(name, "Newspaper")) %>% 
+  select(name, uuid) -> newspaper_collections
+newspaper_collections
+```
+
+What can we then get from a collection? Let's look at the first using this URL
+
+```{r}
+str_c(
+  "https://loar.kb.dk/rest/collections/",
+  first(newspaper_collections %>% pull(uuid))
+)
+```
+
+
+```{r}
+fromJSON(str_c(
+  "https://loar.kb.dk/rest/collections/",
+  first(newspaper_collections %>% pull(uuid))
+))
+```
+
+Which items do we have in that collection?
+
+```{r}
+str_c(
+  "https://loar.kb.dk/rest/collections/",
+  first(newspaper_collections %>% pull(uuid)),
+  "/items"
+)
+```
+
+```{r }
+fromJSON(str_c(
+  "https://loar.kb.dk/rest/collections/",
+  first(newspaper_collections %>% pull(uuid)),
+  "/items"
+))
+```
+Let's pick the first item for a closer look
+
+```{r}
+fromJSON(str_c(
+  "https://loar.kb.dk/rest/collections/",
+  first(newspaper_collections %>% pull(uuid)),
+  "/items"
+)) %>% 
+  pull(uuid) %>%
+  first() -> uuid
+uuid
+```
+
+
+```{r}
+fromJSON(str_c("https://loar.kb.dk/rest/items/",uuid))
+```
+
+
+So, this is wierd, because even though the `bitstreams` value is `NULL`, I know it contains the actual content of the record/item. Let's look at that
+
+```{r}
+fromJSON(str_c("https://loar.kb.dk/rest/items/",uuid,"/bitstreams"))
+```
+And now we're close to the actual data. In the above table, the data is available in bitstream with id  `d2d3869f-ad37-461c-bcb4-79ffc7d9d0fe`, and we get it by using the `retrieve` function from the API. The content is delivered as CSV, and normally I would use the `read_csv` for such data. But this CSV format has some issues with the encoding of quotes. Therefore, we must use the more general `read_delim` function with the two `escape_` parameters.
+
+```{r}
+fromJSON(str_c("https://loar.kb.dk/rest/items/",uuid,"/bitstreams")) %>%
+  filter(name == "artikler_1678.csv") %>%
+  pull(retrieveLink) -> artikler_1678_link
+
+artikler_1678_link
+```
+
+
+
+```{r}
+artikler_1678 <- read_delim(
+  str_c("https://loar.kb.dk/",artikler_1678_link),
+  delim = ",",
+  escape_backslash = TRUE,
+  escape_double = FALSE)
+```
+
+```{r}
+artikler_1678
+```
+
+```{r}
+glimpse(artikler_1678)
+```
+
+# What can we do with the data?
+
+To get an idea about the amount of data, let's count pages
+
+```{r}
+artikler_1678 %>% 
+  group_by(sort_year_asc) %>% 
+  summarise(page_count = sum(newspaper_page)) %>% 
+  arrange(desc(sort_year_asc))
+```
+# Look at the metadata
+
+Unfortunately, to explore the metadata, we have to download all the actual data. Hopefully this will change in the future. Still, the `bitstreams` do have a `sizeBytes` value, so let's collect those, and see how much bandwidth and storage is needed for the full collection. Well, actually for the full four newspaper collections.
+
+So:
+
+  for each newspaper collection
+    for each item
+      sum the `sizeBytes` of bitsteams with name `^artikel_`
+
+First look at the first collection
+
+```{r}
+fromJSON(str_c("https://loar.kb.dk/rest/collections/",newspaper_collections %>% pull(uuid) %>% first() , "/items"))
+```
+Using that technique we can map the above used `fromJSON` function onto a list of ids, to get the items from all the newspaper collections
+      
+```{r}
+map_df(
+  newspaper_collections %>% pull(uuid),
+  ~fromJSON(str_c("https://loar.kb.dk/rest/collections/", .x, "/items"))
+) -> all_items
+all_items
+```
+
+Now, get all the `bitstreams` associated with those items. Fist we can extract the item id
+
+```{r}
+all_items %>% pull(uuid) %>% first()
+```
+
+and from that item id, get a bitstream
+
+```{r}
+fromJSON(
+  str_c(
+    "https://loar.kb.dk/rest/items/",
+    all_items %>% pull(uuid) %>% first(), "/bitstreams"
+  )
+)
+```
+
+The actual bitstream we are interested in, is the one named `artikler_1678.csv`, and we can see that it is the only one with the `CSV` format. Filter for that, and just retain the `name` and `sizeBytes`
+
+```{r}
+fromJSON(
+  str_c(
+    "https://loar.kb.dk/rest/items/",
+    all_items %>% pull(uuid) %>% first(), "/bitstreams"
+  )
+) %>% 
+  filter(format == "CSV") %>% 
+  select(name, sizeBytes)
+```
+
+So, how do we do that for all items? Well, it should be as easy as when getting the items above
+
+```{r, eval=FALSE}
+map_df(
+  all_items %>% filter(row_number() < 4) %>% pull(uuid),
+  ~fromJSON(str_c("https://loar.kb.dk/rest/items/", .x, "/bitstreams"))
+)
+```
+
+But I get that wierd error message?!?
+
+Well, we have this item id: `b4fb558a-1c56-42de-8c56-7fff565bb7b4`. Which bitstreams does that give
+
+```{r}
+fromJSON(str_c("https://loar.kb.dk/rest/items/", "b4fb558a-1c56-42de-8c56-7fff565bb7b4", "/bitstreams"))
+```
+
+Okay, can we use the `map_df`for just that one item?
+
+```{r, eval=FALSE}
+c("b4fb558a-1c56-42de-8c56-7fff565bb7b4") %>% 
+  map_df(
+    ~fromJSON(str_c("https://loar.kb.dk/rest/items/", .x, "/bitstreams"))
+  )
+
+```
+
+No?! Okay, what if I then select the needed columns, and here the assumption is, that one of the unneeded columns are causing the havoc.
+
+```{r}
+c("b4fb558a-1c56-42de-8c56-7fff565bb7b4") %>% 
+  map_df(
+    ~(fromJSON(str_c("https://loar.kb.dk/rest/items/", .x, "/bitstreams")) %>% select(name,sizeBytes))
+)
+```
+
+Oh, that worked! Then try it with a few more items
+
+```{r}
+all_items %>% filter(row_number() < 4) %>% pull(uuid) %>% 
+  map_df(
+    ~(fromJSON(str_c("https://loar.kb.dk/rest/items/", .x, "/bitstreams")) %>% select(name,sizeBytes))
+)
+```
+
+YES! Now build the data frame, that I want. First just for 3 rows (`row_number() < 4)`)
+ 
+```{r}
+all_items %>% filter(row_number() < 4) %>% pull(uuid) %>% 
+  map_df(
+    ~(fromJSON(str_c("https://loar.kb.dk/rest/items/", .x, "/bitstreams")) %>% select(name,sizeBytes, format))
+) %>% 
+  filter(format == "CSV")
+```
+
+And now with everything
+
+```{r}
+all_items %>% pull(uuid) %>% 
+  map_df(
+    ~(fromJSON(str_c("https://loar.kb.dk/rest/items/", .x, "/bitstreams")) %>% select(name,sizeBytes, format, uuid))
+) %>% 
+  filter(format == "CSV") %>% 
+  select(-format) -> all_bitstreams
+```
+
+Let's have a look
+
+```{r}
+all_bitstreams
+```
+
+```{r}
+summary(all_bitstreams)
+```
+
+So at last, we can get the answer to the question regarding the resources needed for downloading the complete collection. But, first lets load a library for formatting numbers in a more human readable way
+
+```{r, message=FALSE}
+library(gdata)
+```
+
+Sum all the bytes
+
+```{r}
+all_bitstreams %>% 
+  summarise(total_bytes = humanReadable(sum(as.numeric(sizeBytes)), standard = "SI"))
+```
+
+That's more or less that same as intalling TeX Live ;-)
+
+# Last example: Look at some text
+
+Let's select a year: 1853. Let's get all the available text from that year. Now, we can cheat a bit, as we have all the bitstreams, and we can filter their names for 1853
+
+```{r}
+all_bitstreams %>% 
+  filter(str_detect(name, "1853.csv"))
+```
+
+Let's get that bitstream using the `GET /bitstreams/{bitstream id}/retrieve`
+
+```{r}
+print(now())
+articles_1853 <- read_delim(
+  "https://loar.kb.dk/rest/bitstreams/f6543ed8-d4ba-40fe-99a8-ba26a5390924/retrieve",
+  delim = ",",
+  escape_backslash = TRUE,
+  escape_double = FALSE)
+print(now())
+```
+
+That took less that a minute, so...
+
+Okay, what did we get
+
+```{r}
+articles_1853
+```
+
+
+
+```{r}
+articles_1853 %>% 
+  mutate(words = str_count(fulltext_org, boundary("word"))) %>% 
+  select(-fulltext_org) %>% 
+  group_by(editionId) %>% 
+  summarise(total_words = sum(words)) %>% 
+  arrange(desc(total_words)) -> articles_1853_word_counts
+articles_1853_word_counts
+```
+
+```{r}
+articles_1853_word_counts %>% 
+  summarise(total = sum(total_words))
+```
+
+15 million words for one year? Well, the validity of that number is left as an exercise...
+
+You can play with this code your self at a [public available RStudio Cloud project](https://rstudio.cloud/project/1321498). The static document is available as a RPUb at [Playing with the LOAR API](https://rpubs.com/perdalum/loar-api).
+
+If you have any questions or comments, please reach me at pmd@kb.dk.
+
